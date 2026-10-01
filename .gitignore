@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Node
+node_modules/
+dist/
+.vite/
+npm-debug.log*
+yarn-error.log*
+
+# FFmpeg shims created at runtime by backend/services/ffmpeg_utils.py
+.bin/
+
+# Generated media, transcripts and the gallery manifest.
+# The folders themselves are kept (with .gitkeep) so a fresh clone has them.
+static/clips/*
+static/downloads/*
+static/transcripts/*
+static/tmp/*
+!static/clips/.gitkeep
+!static/downloads/.gitkeep
+!static/transcripts/.gitkeep
+!static/tmp/.gitkeep
+
+# Local config
+.env
+.env.local
+frontend/.env
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

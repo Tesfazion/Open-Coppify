@@ -1,0 +1,37 @@
+# Coppify backend dependencies
+#
+# Install with:  pip install -r backend/requirements.txt
+#
+# FFmpeg is a native binary, not a pip package. The backend finds it via
+# $FFMPEG_BINARY -> $PATH -> the static build bundled by imageio-ffmpeg, and
+# creates a `.bin/ffmpeg.exe` shim so openai-whisper (which shells out to a
+# bare `ffmpeg`) can find it too. Install imageio-ffmpeg and you never need to
+# touch a system FFmpeg install.
+
+# --- Web framework ---------------------------------------------------------
+Flask>=3.0,<4.0
+flask-cors>=4.0.0
+
+# --- Video ingestion -------------------------------------------------------
+yt-dlp>=2024.1.1
+
+# --- Transcription ---------------------------------------------------------
+openai-whisper>=20231117
+torch>=2.1.0
+
+# --- Video processing ------------------------------------------------------
+# imageio-ffmpeg provides a bundled static FFmpeg, which is why the app works
+# on a machine with no FFmpeg installed. moviepy is optional (documented in the
+# README as an alternative to the direct filter-graph path) but installed so
+# the documented alternative is available.
+imageio-ffmpeg>=0.4.9
+moviepy>=2.0.0
+
+# --- Optional: significantly faster transcription --------------------------
+# Uncomment to use faster-whisper instead of openai-whisper. The backend
+# auto-detects it at runtime and prefers it when present. Much quicker on CPU.
+# faster-whisper>=1.0.0
+
+# --- Optional: faster keyframe-accurate audio slicing ----------------------
+# Used only if you swap in a chunking strategy that needs it.
+# numpy>=1.24

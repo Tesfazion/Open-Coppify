@@ -1,0 +1,25 @@
+{
+  "name": "coppify-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "React + Vite front end for the Coppify video-to-shorts backend",
+  "scripts": {
+    "start": "vite",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 3000"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.1.1",
+    "vite": "^8.3.2"
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

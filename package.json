@@ -1,0 +1,17 @@
+{
+  "name": "coppify",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Turn a YouTube link into 9:16 short clips (yt-dlp + Whisper + FFmpeg)",
+  "scripts": {
+    "install:all": "python -m pip install -r backend/requirements.txt && npm --prefix frontend install",
+    "backend": "python backend/app.py",
+    "frontend": "npm --prefix frontend start",
+    "start": "node scripts/dev.mjs",
+    "build": "npm --prefix frontend run build",
+    "test": "python backend/selftest.py && python backend/smoke_test.py && python backend/integration_check.py"
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}
