@@ -1,0 +1,200 @@
+/* Coppify — design tokens and base layer.
+   ---------------------------------------------------------------------------
+   Tailwind CSS v4. The palette is defined once in @theme so every utility
+   (bg-*, text-*, border-*) is generated from it and cannot drift. Contrast
+   pairs were chosen to clear WCAG 2.2 AA (4.5:1 body, 3:1 large/UI) against
+   the ink-900 surface.
+   -------------------------------------------------------------------------- */
+
+@import 'tailwindcss';
+
+@font-face {
+  font-family: 'Instrument Serif';
+  src: url('./fonts/InstrumentSerif-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Instrument Serif';
+  src: url('./fonts/InstrumentSerif-Italic.ttf') format('truetype');
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Archivo';
+  src: url('./fonts/Archivo-Variable.ttf') format('truetype-variations');
+  font-weight: 100 900;
+  font-stretch: 62% 125%;
+  font-style: normal;
+  font-display: swap;
+}
+
+@theme {
+  /* Neutrals — warm, slightly desaturated. */
+  --color-ink-900: oklch(0.145 0.011 55);
+  --color-ink-850: oklch(0.175 0.012 55);
+  --color-ink-800: oklch(0.208 0.013 55);
+  --color-ink-700: oklch(0.262 0.014 55);
+  --color-ink-600: oklch(0.335 0.014 55);
+  --color-ink-500: oklch(0.47 0.013 57);
+  --color-ink-400: oklch(0.585 0.013 58);
+  --color-ink-300: oklch(0.7 0.012 60);
+  --color-ink-200: oklch(0.83 0.01 62);
+  --color-ink-100: oklch(0.94 0.008 65);
+  --color-ink-050: oklch(0.975 0.005 65);
+
+  /* Sodium — the single accent. */
+  --color-sodium-400: oklch(0.86 0.13 70);
+  --color-sodium-500: oklch(0.79 0.16 58);
+  --color-sodium-600: oklch(0.68 0.16 48);
+  --color-sodium-700: oklch(0.55 0.13 45);
+
+  /* Semantic signals. */
+  --color-good: oklch(0.78 0.13 158);
+  --color-bad: oklch(0.72 0.16 28);
+  --color-warn: oklch(0.82 0.13 78);
+
+  --font-sans: 'Archivo', ui-sans-serif, system-ui, sans-serif;
+  --font-display: 'Instrument Serif', Georgia, 'Times New Roman', serif;
+  --font-mono: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+
+  --radius-card: 0.5rem;
+
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  html {
+    background: var(--color-ink-900);
+    color-scheme: dark;
+    scrollbar-gutter: stable;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-ink-900);
+    color: var(--color-ink-100);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.5;
+    font-synthesis-weight: none;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-weight: 400;
+    margin: 0;
+  }
+
+  a {
+    color: var(--color-sodium-500);
+    text-underline-offset: 3px;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-sodium-500);
+    outline-offset: 2px;
+  }
+
+  :focus:not(:focus-visible) {
+    outline: none;
+  }
+
+  ::selection {
+    background: var(--color-sodium-500);
+    color: var(--color-ink-900);
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--color-ink-900);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-ink-700);
+    border: 3px solid var(--color-ink-900);
+    border-radius: 99px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-ink-600);
+  }
+
+  /* Respect the OS "reduce motion" setting everywhere, without exception. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer utilities {
+  .numeric {
+    font-variant-numeric: tabular-nums;
+  }
+
+  @keyframes sweep {
+    from {
+      transform: scaleX(0);
+    }
+    to {
+      transform: scaleX(1);
+    }
+  }
+
+  .sweep {
+    transform-origin: left;
+    animation: sweep 900ms var(--ease-out-expo) both;
+  }
+
+  @keyframes pulse-soft {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.55;
+    }
+  }
+
+  .pulsing {
+    animation: pulse-soft 1.8s ease-in-out infinite;
+  }
+
+  @keyframes rise {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  .rise {
+    animation: rise 620ms var(--ease-out-expo) both;
+  }
+}

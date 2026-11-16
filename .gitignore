@@ -27,6 +27,10 @@ static/tmp/*
 !static/transcripts/.gitkeep
 !static/tmp/.gitkeep
 
+# Persisted user settings written by backend/services/settings.py. Per-machine
+# state, not source: defaults live in config.py and a missing file is fine.
+static/settings.json
+
 # Local config
 .env
 .env.local

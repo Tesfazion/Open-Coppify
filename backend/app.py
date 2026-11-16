@@ -151,7 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     except ffmpeg_utils.FfmpegNotFound as exc:
         logger.error("  ffmpeg       : MISSING -- %s", exc)
     logger.info("  listening on : http://%s:%s", args.host, args.port)
-    logger.info("  frontend dev : http://localhost:3000 (run `npm start` in frontend/)")
+    logger.info("  frontend dev : http://localhost:4041 (run `npm start` in frontend/)")
 
     app.run(
         host=args.host,

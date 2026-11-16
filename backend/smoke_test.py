@@ -229,7 +229,7 @@ def main() -> int:
         preflight = requests.options(
             f"{BASE}/api/clips",
             headers={
-                "Origin": "http://localhost:3000",
+                "Origin": "http://localhost:4041",
                 "Access-Control-Request-Method": "POST",
             },
             timeout=30,

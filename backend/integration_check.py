@@ -1,15 +1,16 @@
 """End-to-end integration check: real backend + real Vite dev server.
 
 Starts ``python app.py`` and ``npm start`` as separate processes (exactly how the
-user runs them), then verifies the front end is served, that the JSX module graph
-transforms without error, and that the browser's cross-origin call from
-http://localhost:3000 to the Flask API is permitted.
+user runs them), then verifies the front end is served, that the TypeScript/TSX
+module graph transforms without error, and that the backend still permits the
+dev origin for deployments that point the built app at it directly.
 
 Run with:  python backend/integration_check.py
 """
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 import time
@@ -20,7 +21,7 @@ import requests
 ROOT = Path(__file__).resolve().parent.parent
 FRONTEND = ROOT / "frontend"
 BACKEND_PORT = 5098
-FRONTEND_PORT = 3000
+FRONTEND_PORT = 4041
 API = f"http://127.0.0.1:{BACKEND_PORT}"
 WEB = f"http://localhost:{FRONTEND_PORT}"
 
@@ -63,12 +64,21 @@ def main() -> int:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
+
+    # Vite is launched directly rather than through `npm start`.
+    #
+    # `npm start` on Windows is a .cmd shim, so it only runs with shell=True and
+    # the process we would hold is cmd.exe. Terminating that leaves the real
+    # node process listening on the port as an orphan, and the next run of this
+    # script fails because the Vite port is still in use while the backend --
+    # which is spawned directly -- shut down cleanly. Holding the node process
+    # directly makes terminate() actually stop the server.
+    node = shutil.which("node") or "node"
     frontend = subprocess.Popen(
-        ["npm", "start"],
+        [node, "node_modules/vite/bin/vite.js"],
         cwd=str(FRONTEND),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        shell=True,
     )
 
     try:
@@ -84,25 +94,38 @@ def main() -> int:
         print("\n[2] Frontend boots via `npm start`")
         page = wait_for(WEB).text
         check("index.html served", "<div id=\"root\"></div>" in page)
-        check("references /src/main.jsx", "/src/main.jsx" in page)
+        check("references /src/main.tsx", "/src/main.tsx" in page)
 
-        # The dev server must transform every module the app imports.
+        # The dev server must transform every module the app imports. This is the
+        # check that catches a deleted file still being imported somewhere: the
+        # production build would pass, because Vite starts from main.tsx and
+        # never reaches the orphaned import, while the dev server has to resolve
+        # every graph node.
         for module, needle in [
-            ("/src/main.jsx", "react"),
-            ("/src/App.jsx", "ClipGallery"),
-            ("/src/api.js", "axios"),
-            ("/src/hooks/useJob.js", "getJob"),
-            ("/src/components/ClipGallery.jsx", "clip__frame"),
-            ("/src/components/OptionsPanel.jsx", "verticalMode"),
-            ("/src/components/ProgressPanel.jsx", "progressbar"),
-            ("/src/components/TranscriptPanel.jsx", "Transcript"),
-            ("/src/components/HealthBar.jsx", "health"),
-            ("/src/components/UrlForm.jsx", "youtube-url"),
-            ("/src/utils/youtube.js", "extractVideoId"),
+            ("/src/main.tsx", "createRoot"),
+            ("/src/App.tsx", "Routes"),
+            ("/src/lib/api.ts", "describeError"),
+            ("/src/lib/format.ts", "extractVideoId"),
+            ("/src/hooks/useJobStream.ts", "EventSource"),
+            ("/src/pages/Ingest.tsx", "extractVideoId"),
+            ("/src/pages/JobProgress.tsx", "useJobStream"),
+            ("/src/pages/Review.tsx", "patchClip"),
+            ("/src/pages/Library.tsx", "listProjects"),
+            ("/src/pages/Settings.tsx", "putSettings"),
+            ("/src/pages/About.tsx", "SIL Open Font License"),
+            ("/src/components/AppShell.tsx", "Skip to content"),
+            ("/src/components/ClipPlayer.tsx", "TrimBar"),
+            ("/src/components/TranscriptPanel.tsx", "clipWords"),
+            ("/src/components/SystemBadge.tsx", "ytdlp_version"),
+            ("/src/components/ErrorNote.tsx", "hint"),
+            ("/src/components/ui.tsx", "buttonClass"),
+            ("/src/index.css", "sodium-500"),
+            # Copied from the reference app so both platforms share typography.
+            ("/src/fonts/Archivo-Variable.ttf", ""),
         ]:
             response = requests.get(f"{WEB}{module}", timeout=20)
             body = response.text
-            ok = response.status_code == 200 and needle in body
+            ok = response.status_code == 200 and (not needle or needle in body)
             check(f"module {module} transforms", ok,
                   f"status={response.status_code}")
 
@@ -118,7 +141,7 @@ def main() -> int:
         )
         check("preflight succeeds",
               preflight.status_code in {200, 204}, str(preflight.status_code))
-        check("allows localhost:3000",
+        check("allows configured Vite origin",
               preflight.headers.get("Access-Control-Allow-Origin") in {WEB, "*"},
               preflight.headers.get("Access-Control-Allow-Origin", "<none>"))
 
@@ -142,6 +165,10 @@ def main() -> int:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 process.kill()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    print(f"[cleanup] warning: {name} did not exit")
         print("\n[cleanup] stopped both servers")
 
     print("\n" + "=" * 66)

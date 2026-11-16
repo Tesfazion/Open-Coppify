@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from config import (
+    ASPECT_RATIOS,
+    CAPTION_STYLES,
     CLIP_AUDIO_BITRATE,
     CLIP_CRF,
     CLIP_MAX_SECONDS,
@@ -33,8 +35,11 @@ from config import (
     CLIP_PRESET,
     CLIP_TARGET_SECONDS,
     CLIPS_DIR,
+    DEFAULT_ASPECT_RATIO,
+    DEFAULT_CAPTION_STYLE,
     VERTICAL_HEIGHT,
     VERTICAL_WIDTH,
+    WRITE_SRT_SIDECAR,
 )
 from jobs import JobContext
 from services import ffmpeg_utils
@@ -45,6 +50,12 @@ CAPTION_MAX_CHARS = 42
 CAPTION_MAX_LINES = 2
 CAPTION_MAX_SECONDS = 4.0
 CAPTION_GAP = 0.7
+
+# Review-time curation states. Everything starts as a candidate.
+CLIP_STATUSES = ("candidate", "kept", "discarded")
+
+# Shorter than this and a clip is not worth a file on disk.
+MIN_CLIP_SECONDS = 3.0
 
 FONT_CANDIDATES = [
     Path("C:/Windows/Fonts/arialbd.ttf"),
@@ -273,13 +284,31 @@ def _find_font() -> Path | None:
     return None
 
 
-def build_subtitle_filter(srt_path: Path) -> str | None:
+def caption_style(key: str | None) -> dict[str, str]:
+    """Look up a caption style, falling back to the default for unknown keys."""
+    if key and key in CAPTION_STYLES:
+        return CAPTION_STYLES[key]
+    return CAPTION_STYLES[DEFAULT_CAPTION_STYLE]
+
+
+def caption_style_catalog() -> list[dict[str, str]]:
+    return [
+        {"key": key, "label": style["label"], "description": style["description"]}
+        for key, style in CAPTION_STYLES.items()
+    ]
+
+
+def build_subtitle_filter(srt_path: Path, style_key: str | None = None) -> str | None:
     """Style + attach an SRT file, or ``None`` if libass/fontconfig is absent."""
     escaped = ffmpeg_utils.escape_filter_path(srt_path)
+    spec = caption_style(style_key)
     style = (
-        "FontName=Arial,Bold,FontSize=20,PrimaryColour=&H00FFFFFF,"
-        "OutlineColour=&H00000000,BorderStyle=3,Outline=2,Shadow=0,"
-        "Alignment=2,MarginV=140,Bold=1"
+        f"FontName={spec['font']},FontSize={spec['size']},"
+        f"PrimaryColour={spec['primary']},"
+        f"OutlineColour={spec['outline_colour']},"
+        f"BorderStyle={spec['border_style']},Outline={spec['outline']},"
+        f"Shadow={spec['shadow']},Alignment={spec['alignment']},"
+        f"MarginV={spec['margin_v']},Bold={spec['bold']}"
     )
     # Commas separate filter options, so they must be escaped inside the value.
     escaped_style = style.replace(",", r"\,")
@@ -341,11 +370,15 @@ def render_clip(
     srt_path: Path | None = None,
     source_size: tuple[int, int] | None = None,
     on_progress: Callable[[float, str], None] | None = None,
+    aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+    caption_style_key: str | None = None,
 ) -> dict[str, Any]:
-    """Cut ``[start, end)`` from ``source`` into a vertical clip at ``dest``.
+    """Cut ``[start, end)`` from ``source`` into a clip at ``dest``.
 
-    ``on_progress(fraction, stage)`` is optional; without it the caller keeps
-    whatever progress it had already reported.
+    ``aspect_ratio`` selects the output dimensions from :data:`config.ASPECT_RATIOS`
+    (falling back to 9:16 for an unknown value, so a stale client cannot ask for
+    a size that does not exist). ``on_progress(fraction, stage)`` is optional;
+    without it the caller keeps whatever progress it had already reported.
     """
     source = Path(source)
     dest = Path(dest)
@@ -353,6 +386,8 @@ def render_clip(
 
     if not source.exists():
         raise FileNotFoundError(f"Source video not found: {source}")
+
+    out_width, out_height = ASPECT_RATIOS.get(aspect_ratio, ASPECT_RATIOS[DEFAULT_ASPECT_RATIO])
 
     duration = max(0.5, end - start)
     if start < 0:
@@ -363,10 +398,13 @@ def render_clip(
         source_size = (info.width, info.height)
     src_w, src_h = source_size
 
-    video_filter = build_video_filter(src_w, src_h, mode=vertical_mode)
+    video_filter = build_video_filter(
+        src_w, src_h, mode=vertical_mode,
+        out_width=out_width, out_height=out_height,
+    )
 
     if captions and srt_path and srt_path.exists():
-        subtitle_filter = build_subtitle_filter(srt_path)
+        subtitle_filter = build_subtitle_filter(srt_path, caption_style_key)
         if subtitle_filter:
             video_filter = f"{video_filter},{subtitle_filter}"
 
@@ -430,10 +468,13 @@ def render_clip(
         "start": round(start, 2),
         "end": round(end, 2),
         "duration": round(duration, 2),
-        "width": VERTICAL_WIDTH,
-        "height": VERTICAL_HEIGHT,
+        "width": out_width,
+        "height": out_height,
+        "aspect_ratio": aspect_ratio if aspect_ratio in ASPECT_RATIOS else DEFAULT_ASPECT_RATIO,
         "size": dest.stat().st_size,
         "vertical_mode": vertical_mode,
+        "caption_style": caption_style(caption_style_key).get("label", caption_style_key),
+        "caption_style_key": caption_style_key or DEFAULT_CAPTION_STYLE,
         "has_captions": bool(captions and srt_path and srt_path.exists()),
     }
 
@@ -482,8 +523,10 @@ def generate_clips(
     target_seconds: float = CLIP_TARGET_SECONDS,
     vertical_mode: str = "blur",
     captions: bool = False,
+    aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+    caption_style_key: str | None = None,
 ) -> dict[str, Any]:
-    """Select moments then render each one to a vertical clip."""
+    """Select moments then render each one to a clip."""
     source = Path(source)
     if not source.exists():
         raise FileNotFoundError(f"Source video not found: {source}")
@@ -563,6 +606,8 @@ def generate_clips(
             srt_path=srt_path,
             source_size=(info.width, info.height),
             on_progress=report,
+            aspect_ratio=aspect_ratio,
+            caption_style_key=caption_style_key,
         )
 
         poster = render_thumbnail(
@@ -585,15 +630,22 @@ def generate_clips(
             "duration": rendered["duration"],
             "width": rendered["width"],
             "height": rendered["height"],
-            "aspect_ratio": "9:16",
+            "aspect_ratio": rendered["aspect_ratio"],
             "format": "vertical",
             "vertical_mode": rendered["vertical_mode"],
+            "caption_style": rendered["caption_style"],
+            "caption_style_key": rendered["caption_style_key"],
             "captions": rendered["has_captions"],
             "size": rendered["size"],
             "score": pick.get("score", 0),
             "keywords": pick.get("keywords") or [],
             "reasons": pick.get("reasons") or [],
             "excerpt": (pick.get("text") or "")[:600],
+            # Everything starts as a candidate: the review screen is where a
+            # human decides what actually ships.
+            "status": "candidate",
+            "user_trimmed": False,
+            "exports": [],
             "created_at": time.time(),
         }
         records.append(record)
@@ -611,6 +663,7 @@ def generate_clips(
         "video_id": video_id,
         "title": title,
         "vertical_mode": vertical_mode,
+        "aspect_ratio": aspect_ratio if aspect_ratio in ASPECT_RATIOS else DEFAULT_ASPECT_RATIO,
         "captions": captions,
         "clip_count": len(records),
         "clips": records,
@@ -659,15 +712,42 @@ def merge_manifest(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return merged
 
 
+def _normalize(clip: dict[str, Any]) -> dict[str, Any]:
+    """Fill in fields added after a clip was first written.
+
+    Manifests written by an older version have no ``status``/``exports``, and
+    hand-edited manifests can be missing more. Normalising on read keeps every
+    consumer -- routes, the review screen -- free of ``.get(..., default)``
+    chains that silently paper over a malformed record.
+    """
+    clip.setdefault("status", "candidate")
+    if clip["status"] not in CLIP_STATUSES:
+        clip["status"] = "candidate"
+    clip.setdefault("exports", [])
+    clip.setdefault("user_trimmed", False)
+    clip.setdefault("caption_style_key", DEFAULT_CAPTION_STYLE)
+    clip.setdefault("aspect_ratio", clip.get("aspect_ratio") or DEFAULT_ASPECT_RATIO)
+    clip.setdefault("reasons", [])
+    clip.setdefault("keywords", [])
+    clip.setdefault("excerpt", "")
+    return clip
+
+
 def list_clips(*, video_id: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
     clips = load_manifest().get("clips", [])
     # Drop entries whose file vanished (manual deletion, cleanup script).
     alive = [clip for clip in clips if (CLIPS_DIR / str(clip.get("filename", ""))).exists()]
     if video_id:
         alive = [clip for clip in alive if clip.get("video_id") == video_id]
+    alive = [_normalize(clip) for clip in alive]
     if limit:
         alive = alive[:limit]
     return alive
+
+
+def get_clip(clip_id: str) -> dict[str, Any] | None:
+    """One clip by id, or ``None``."""
+    return next((clip for clip in list_clips() if clip.get("id") == clip_id), None)
 
 
 def delete_clip(clip_id: str) -> bool:
@@ -683,3 +763,241 @@ def delete_clip(clip_id: str) -> bool:
     data["clips"] = [clip for clip in clips if clip.get("id") != clip_id]
     save_manifest(data)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Review-time mutations
+#
+# The generator is one-shot: it picks moments and renders them. Everything below
+# exists so a human can revise that output without re-running selection, which
+# would throw away their decisions and pick different moments.
+# ---------------------------------------------------------------------------
+
+
+def _persist(data: dict[str, Any], clip: dict[str, Any]) -> dict[str, Any]:
+    save_manifest(data)
+    return _normalize(clip)
+
+
+def update_clip(
+    clip_id: str,
+    *,
+    status: str | None = None,
+    start: float | None = None,
+    end: float | None = None,
+    title: str | None = None,
+) -> dict[str, Any] | None:
+    """Apply a metadata change to a clip. Returns the updated record.
+
+    Only the manifest changes here -- ``start``/``end`` describe the selection,
+    and the file is re-encoded separately by :func:`rerender_clip`. Keeping the
+    two apart means dragging a trim handle is instant while the encode, which is
+    the slow part, happens once on release.
+    """
+    data = load_manifest()
+    clip = next((c for c in data.get("clips", []) if c.get("id") == clip_id), None)
+    if clip is None:
+        return None
+
+    if status is not None:
+        status = str(status).strip().lower()
+        if status not in CLIP_STATUSES:
+            raise ValueError(f"status must be one of: {', '.join(CLIP_STATUSES)}")
+        clip["status"] = status
+
+    original_start = float(clip.get("start") or 0.0)
+    original_end = float(clip.get("end") or 0.0)
+
+    if start is not None or end is not None:
+        new_start = float(start) if start is not None else original_start
+        new_end = float(end) if end is not None else original_end
+        new_start = max(0.0, new_start)
+        if new_end - new_start < MIN_CLIP_SECONDS:
+            raise ValueError(
+                f"A clip must be at least {MIN_CLIP_SECONDS:.0f}s long."
+            )
+        if new_end <= new_start:
+            raise ValueError("end must be after start.")
+        clip["start"] = round(new_start, 2)
+        clip["end"] = round(new_end, 2)
+        clip["duration"] = round(new_end - new_start, 2)
+        # Track whether this is still where the selector put it, so the UI can
+        # label a clip as hand-trimmed rather than guessing from the numbers.
+        if abs(new_start - original_start) > 0.01 or abs(new_end - original_end) > 0.01:
+            clip["user_trimmed"] = True
+
+    if title is not None:
+        cleaned = re.sub(r"[^\w\s\-.?!,'\"]", "", str(title)).strip()[:140]
+        clip["title"] = cleaned or clip.get("title")
+
+    clip["updated_at"] = time.time()
+    return _persist(data, clip)
+
+
+def rerender_clip(
+    ctx: JobContext,
+    clip_id: str,
+    *,
+    aspect_ratio: str | None = None,
+    caption_style_key: str | None = None,
+    captions: bool | None = None,
+    video_id: str | None = None,
+) -> dict[str, Any]:
+    """Re-encode a clip in place at the current trim, ratio, and caption style.
+
+    Requires the original download. If it has been cleaned up this raises a
+    ``FileNotFoundError`` naming the video id, which the route turns into an
+    actionable message rather than a bare 500.
+    """
+    clip = get_clip(clip_id)
+    if clip is None:
+        raise FileNotFoundError(f"Unknown clip: {clip_id}")
+
+    target_video = video_id or str(clip.get("video_id") or "")
+    source = _source_for(target_video)
+    if source is None:
+        raise FileNotFoundError(
+            f"The downloaded video for {target_video or 'this clip'} is no longer on "
+            "disk, so the clip cannot be re-rendered. Re-download the source first."
+        )
+
+    ratio = aspect_ratio or str(clip.get("aspect_ratio") or DEFAULT_ASPECT_RATIO)
+    if ratio not in ASPECT_RATIOS:
+        raise ValueError(f"aspect_ratio must be one of: {', '.join(ASPECT_RATIOS)}")
+    style_key = caption_style_key or str(
+        clip.get("caption_style_key") or DEFAULT_CAPTION_STYLE
+    )
+    if style_key not in CAPTION_STYLES:
+        raise ValueError(f"caption_style must be one of: {', '.join(CAPTION_STYLES)}")
+    want_captions = bool(clip.get("captions", True)) if captions is None else bool(captions)
+
+    start = float(clip.get("start") or 0.0)
+    end = float(clip.get("end") or 0.0)
+
+    ctx.progress(10, "Preparing captions")
+    srt_path: Path | None = None
+    if want_captions:
+        transcript = _load_transcript_for(target_video)
+        if transcript:
+            cues = build_caption_cues(transcript, start, end)
+            if cues:
+                srt_path = write_srt(cues, CLIPS_DIR / f"{clip_id}.srt")
+
+    ctx.progress(20, f"Re-rendering at {ratio}")
+    dest = CLIPS_DIR / str(clip.get("filename") or f"{clip_id}.mp4")
+    rendered = render_clip(
+        ctx,
+        source,
+        dest,
+        start=start,
+        end=end,
+        vertical_mode=str(clip.get("vertical_mode") or "blur"),
+        captions=want_captions,
+        srt_path=srt_path,
+        aspect_ratio=ratio,
+        caption_style_key=style_key,
+        on_progress=lambda fraction, stage: ctx.progress(
+            20 + (fraction * 75), stage
+        ),
+    )
+
+    ctx.progress(96, "Refreshing poster")
+    poster = render_thumbnail(ctx, dest, CLIPS_DIR / f"{clip_id}.jpg", at=(end - start) / 2)
+
+    clip.update(
+        {
+            "width": rendered["width"],
+            "height": rendered["height"],
+            "aspect_ratio": rendered["aspect_ratio"],
+            "size": rendered["size"],
+            "duration": rendered["duration"],
+            "captions": rendered["has_captions"],
+            "caption_style": rendered["caption_style"],
+            "caption_style_key": style_key,
+            "poster_url": f"/static/clips/{poster}" if poster else clip.get("poster_url"),
+            "updated_at": time.time(),
+        }
+    )
+    record = merge_manifest([clip])
+    updated = next((c for c in record if c.get("id") == clip_id), clip)
+    return _normalize(updated)
+
+
+def register_export(clip_id: str, *, ratio: str, style: str, size_bytes: int) -> dict[str, Any] | None:
+    """Record a completed render so the review screen can offer it for download."""
+    clip = get_clip(clip_id)
+    if clip is None:
+        return None
+    exports = list(clip.get("exports") or [])
+    exports.insert(
+        0,
+        {
+            "id": f"{clip_id}-{int(time.time())}",
+            "ratio": ratio,
+            "style": style,
+            "size_bytes": int(size_bytes),
+            "created_at": time.time(),
+            "download_url": f"/api/clips/{clip_id}/download",
+        },
+    )
+    clip["exports"] = exports[:8]
+    return merge_manifest([clip]) and _normalize(clip)
+
+
+def clip_words(clip_id: str) -> list[dict[str, Any]]:
+    """Word timings inside a clip, relative to the clip start.
+
+    Drives the trim bar's density readout and the caption editor. Returns an
+    empty list when the transcript was never generated or has no word timings --
+    both are normal, so callers must handle it rather than treat it as an error.
+    """
+    clip = get_clip(clip_id)
+    if clip is None:
+        return []
+    transcript = _load_transcript_for(str(clip.get("video_id") or ""))
+    if not transcript:
+        return []
+
+    start = float(clip.get("start") or 0.0)
+    end = float(clip.get("end") or 0.0)
+    out: list[dict[str, Any]] = []
+    for word in transcript.get("words") or []:
+        if word.get("start") is None or word.get("end") is None:
+            continue
+        word_start = float(word["start"])
+        word_end = float(word["end"])
+        if word_end <= start or word_start >= end:
+            continue
+        out.append(
+            {
+                "text": str(word.get("word") or "").strip(),
+                "start": round(max(0.0, word_start - start), 3),
+                "end": round(min(end, word_end) - start, 3),
+                "source_start": round(word_start, 3),
+                "probability": word.get("probability"),
+            }
+        )
+    return out
+
+
+def _source_for(video_id: str):
+    """Locate the downloaded media for ``video_id``, if still present."""
+    if not video_id:
+        return None
+    try:
+        from services import downloader
+
+        return downloader.find_existing_video(video_id)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _load_transcript_for(video_id: str) -> dict[str, Any] | None:
+    if not video_id:
+        return None
+    try:
+        from services import transcriber
+
+        return transcriber.load_transcript(video_id)
+    except Exception:  # noqa: BLE001
+        return None

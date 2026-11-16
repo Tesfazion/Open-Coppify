@@ -390,13 +390,262 @@ def test_endpoints_exist() -> None:
         "/api/download", "/api/transcribe", "/api/clips",
         "/api/jobs/<job_id>", "/api/health",
         "/api/transcript/<video_id>", "/api/video/<video_id>",
-        "/api/clips/<job_id>", "/api/clips/<clip_id>/download",
+        "/api/clips/<clip_id>", "/api/clips/<clip_id>/download",
         "/static/clips/<path:filename>",
     }
     for route in sorted(required):
         check(f"route {route}", route in rules)
+
+    # Clip-job status used to live at /api/clips/<job_id>, which cannot coexist
+    # with /api/clips/<clip_id> -- one segment cannot be both a job id and a clip
+    # id. It moved to an explicit /clips/job/<id> prefix.
+    check("route /api/clips/job/<job_id>", "/api/clips/job/<job_id>" in rules)
+    check("no ambiguous /api/clips/<id>", "/api/clips/<job_id>" not in rules)
+
+    # Surface added for the review screen, library, and live progress.
+    for route in (
+        "/api/jobs/<job_id>/events",
+        "/api/jobs/<job_id>/retry",
+        "/api/clips/<clip_id>/words",
+        "/api/clips/<clip_id>/srt",
+        "/api/clips/<clip_id>/subtitle",
+        "/api/clips/<clip_id>/render",
+        "/api/projects",
+        "/api/library",
+        "/api/settings",
+    ):
+        check(f"route {route}", route in rules)
+
+    # Werkzeug builds one rule per (path, method) pair, so methods for a path
+    # have to be unioned across rules rather than read off the first match.
+    methods: dict[str, set[str]] = {}
+    for rule in app.url_map.iter_rules():
+        methods.setdefault(rule.rule, set()).update(rule.methods or set())
+    check("PATCH /api/clips/<clip_id>", "PATCH" in methods.get("/api/clips/<clip_id>", set()))
+    check("PUT /api/settings", "PUT" in methods.get("/api/settings", set()))
+    check("GET /api/clips/<clip_id>", "GET" in methods.get("/api/clips/<clip_id>", set()))
+
     check("clips dir is git-ignorable + exists",
           (Path(__file__).resolve().parent.parent / "static" / "clips").is_dir())
+
+
+def test_settings_store() -> None:
+    print("\n[10] Persisted settings")
+    from services import settings
+
+    original = settings.SETTINGS_PATH
+    backup = original.read_bytes() if original.exists() else None
+    try:
+        settings.reset()
+        base = settings.load()
+        check("defaults present", set(base) >= {"clip_count", "min_seconds", "max_seconds"})
+        check("defaults ordered",
+              base["min_seconds"] <= base["target_seconds"] <= base["max_seconds"],
+              f"{base['min_seconds']}/{base['target_seconds']}/{base['max_seconds']}")
+
+        # A partial update must not reset keys it did not mention.
+        settings.save({"clip_count": 7})
+        after = settings.load()
+        check("partial update keeps other keys", after["vertical_mode"] == base["vertical_mode"])
+        check("partial update applied", after["clip_count"] == 7)
+
+        # Out-of-range and unknown values are clamped, not accepted verbatim.
+        hostile = settings.save({
+            "clip_count": 10_000,
+            "aspect_ratio": "21:9",
+            "vertical_mode": "spiral",
+            "whisper_model": "gigantic",
+            "caption_style": "neon",
+            "min_seconds": 5000,
+            "max_seconds": 5,
+        })
+        check("clip_count clamped", hostile["clip_count"] == settings.LIMITS["clip_count"][1])
+        check("aspect ratio falls back", hostile["aspect_ratio"] == "9:16")
+        check("vertical mode falls back", hostile["vertical_mode"] == base["vertical_mode"])
+        check("whisper falls back", hostile["whisper_model"] == base["whisper_model"])
+        check("caption style falls back", hostile["caption_style"] == base["caption_style"])
+
+        # An inverted range must still produce a usable ordering downstream,
+        # or select_clips() receives max < min and selects nothing.
+        check("inverted range repaired",
+              hostile["min_seconds"] <= hostile["target_seconds"] <= hostile["max_seconds"],
+              f"{hostile['min_seconds']}/{hostile['target_seconds']}/{hostile['max_seconds']}")
+
+        settings.save({"keywords": "alpha, beta ,, gamma"})
+        check("keywords cleaned", settings.load()["keywords"] == "alpha, beta, gamma")
+
+        # Survives a reload from disk, which is the whole point of persisting.
+        check("survives reload", settings.load()["clip_count"] == settings.LIMITS["clip_count"][1])
+
+        # A corrupt file must not stop the app booting.
+        settings.SETTINGS_PATH.write_text("{not json", encoding="utf-8")
+        check("corrupt file falls back to defaults",
+              settings.load()["clip_count"] == settings._defaults()["clip_count"])
+
+        # And the choices offered to the UI must be non-empty and match config.
+        public = settings.public()
+        check("ratios offered", public["aspect_ratios"] == ["9:16", "1:1", "16:9"])
+        check("caption styles offered", len(public["caption_styles"]) >= 3)
+        check("whisper models offered", len(public["whisper_models"]) >= 5)
+    finally:
+        if backup is not None:
+            settings.SETTINGS_PATH.write_bytes(backup)
+        else:
+            settings.SETTINGS_PATH.unlink(missing_ok=True)
+
+
+def test_clip_curation() -> None:
+    print("\n[11] Clip curation + review mutations")
+    from services import clipper
+
+    # A fake record is enough: these paths are pure manifest bookkeeping and
+    # deliberately do not touch ffmpeg.
+    clip_id = "selftest_clip_00"
+    dest = clipper.CLIPS_DIR / f"{clip_id}.mp4"
+    dest.write_bytes(b"\x00" * 64)  # list_clips drops records with no file
+    try:
+        clipper.merge_manifest([{
+            "id": clip_id,
+            "video_id": "selftestvid",
+            "filename": dest.name,
+            "title": "Test clip",
+            "start": 10.0,
+            "end": 50.0,
+            "duration": 40.0,
+            "created_at": 1.0,
+        }])
+
+        # An old manifest entry with no status/exports must still read cleanly.
+        clip = clipper.get_clip(clip_id)
+        check("normalised legacy record", clip is not None and clip["status"] == "candidate")
+        check("legacy exports defaulted", clip is not None and clip["exports"] == [])
+
+        updated = clipper.update_clip(clip_id, status="kept")
+        check("status kept", updated is not None and updated["status"] == "kept")
+        check("status persists", clipper.get_clip(clip_id)["status"] == "kept")
+
+        try:
+            clipper.update_clip(clip_id, status="banana")
+            check("invalid status rejected", False)
+        except ValueError:
+            check("invalid status rejected", True)
+
+        trimmed = clipper.update_clip(clip_id, start=12.5, end=48.0)
+        check("trim applied", trimmed is not None and trimmed["start"] == 12.5)
+        check("duration recomputed", trimmed is not None and trimmed["duration"] == 35.5)
+        check("trim flagged", trimmed is not None and trimmed["user_trimmed"] is True)
+
+        # Sub-minimum and inverted trims are the two ways this corrupts a render.
+        try:
+            clipper.update_clip(clip_id, start=10.0, end=11.0)
+            check("too-short trim rejected", False)
+        except ValueError:
+            check("too-short trim rejected", True)
+
+        try:
+            clipper.update_clip(clip_id, start=90.0, end=20.0)
+            check("inverted trim rejected", False)
+        except ValueError:
+            check("inverted trim rejected", True)
+
+        check("rejected trim left record intact",
+              clipper.get_clip(clip_id)["start"] == 12.5)
+
+        check("unknown clip returns None", clipper.get_clip("does_not_exist") is None)
+        check("update unknown returns None", clipper.update_clip("nope", status="kept") is None)
+
+        # No transcript for this fake video: words must be empty, not an error.
+        check("words empty without transcript", clipper.clip_words(clip_id) == [])
+    finally:
+        clipper.delete_clip(clip_id)
+        dest.unlink(missing_ok=True)
+        # Do not leave the record behind if the file was already gone.
+        data = clipper.load_manifest()
+        data["clips"] = [c for c in data.get("clips", []) if c.get("id") != clip_id]
+        clipper.save_manifest(data)
+
+
+def test_job_streaming() -> None:
+    print("\n[12] Job progress streaming + retry")
+    import queue as queue_mod
+    import time as time_mod
+
+    from jobs import JobStore
+
+    store = JobStore(max_jobs=10)
+
+    def worker(ctx):
+        for step in range(1, 4):
+            ctx.progress(step * 30, f"stage {step}")
+            ctx.log(f"log {step}")
+            time_mod.sleep(0.01)
+        return {"value": 42}
+
+    job = store.submit("demo", worker, params={"a": 1})
+    sink = job.subscribe()
+
+    events: list[dict] = []
+    deadline = time_mod.time() + 5
+    while time_mod.time() < deadline:
+        try:
+            events.append(sink.get(timeout=0.25))
+        except queue_mod.Empty:
+            pass
+        if events and events[-1]["event"] in {"succeeded", "failed", "cancelled"}:
+            break
+    job._done.wait(5)
+
+    kinds = {event["event"] for event in events}
+    # A late subscriber must not render blank, so the first frame is a snapshot.
+    check("snapshot replayed on subscribe", "snapshot" in kinds, str(kinds))
+    check("progress events emitted", "progress" in kinds, str(kinds))
+    check("log events emitted", "log" in kinds, str(kinds))
+    check("terminal event emitted", "succeeded" in kinds, str(kinds))
+    check("job succeeded", job.status == "succeeded")
+    check("result retained", job.result == {"value": 42})
+
+    progress_values = [e["progress"] for e in events if e["event"] == "progress"]
+    check("progress is monotonic",
+          progress_values == sorted(progress_values), str(progress_values))
+
+    retried = store.retry(job.id)
+    check("retry issues a new id", retried is not None and retried.id != job.id)
+    if retried:
+        retried._done.wait(5)
+        check("retry succeeds", retried.status == "succeeded")
+        check("retry keeps type", retried.type == "demo")
+        check("retry is cancellable", retried.status not in {"queued", "running"})
+
+    check("retry unknown returns None", store.retry("nope") is None)
+
+    # A listener that walks away must not be able to break the worker.
+    stale = job.subscribe()
+    job.unsubscribe(stale)
+    again = store.submit("demo2", worker)
+    again._done.wait(5)
+    check("unsubscribed listener does not break job", again.status == "succeeded")
+
+
+def test_projects_index() -> None:
+    print("\n[13] Project index")
+    from services import projects
+
+    records = projects.list_projects()
+    check("index returns a list", isinstance(records, list))
+    check("index is well-formed",
+          all({"video_id", "title", "clip_count", "downloaded"} <= set(r)
+              for r in records))
+    check("index is newest first",
+          all(records[i]["updated_at"] >= records[i + 1]["updated_at"]
+              for i in range(len(records) - 1)))
+    check("unknown project is None", projects.get_project("definitely_not_here") is None)
+
+    summary = projects.library_summary()
+    check("summary has counts",
+          {"projects", "clips", "kept", "media_bytes"} <= set(summary))
+
+    projects.invalidate()
+    check("invalidate is safe", projects.list_projects() is not None)
 
 
 def main() -> int:
@@ -411,6 +660,10 @@ def main() -> int:
     test_vertical_filters()
     test_render_clip()
     test_endpoints_exist()
+    test_settings_store()
+    test_clip_curation()
+    test_job_streaming()
+    test_projects_index()
 
     print("\n" + "=" * 66)
     print(f"passed: {PASSED}   failed: {len(FAILED)}")

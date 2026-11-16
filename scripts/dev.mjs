@@ -16,7 +16,7 @@ import path from 'node:path'
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 const BACKEND_PORT = process.env.COPPIFY_PORT || '5000'
-const FRONTEND_PORT = process.env.FRONTEND_PORT || '3000'
+const FRONTEND_PORT = process.env.FRONTEND_PORT || '4041'
 
 const BACKEND_PORT_IS_NUMBER = /^\d+$/.test(BACKEND_PORT)
 
@@ -42,12 +42,19 @@ let shuttingDown = false
 const IS_WINDOWS = process.platform === 'win32'
 
 /**
- * `npm` is a .cmd shim on Windows, which needs the shell. Passing arguments
- * through a shell is also a deprecation warning in modern Node, so on Windows
- * we invoke npm.cmd directly with no shell, and elsewhere we use the real npm.
+ * `npm` is a .cmd shim on Windows and cannot be spawned without a shell, but
+ * passing arguments through `shell: true` raises Node's DEP0190 deprecation
+ * warning. Routing through cmd.exe keeps the arguments intact and avoids it.
+ * On other platforms npm is a normal executable.
  */
-function npmCommand() {
-  return IS_WINDOWS ? 'npm.cmd' : 'npm'
+function frontendCommand() {
+  if (IS_WINDOWS) {
+    return {
+      command: process.env.ComSpec || 'cmd.exe',
+      args: ['/d', '/s', '/c', 'npm', '--prefix', 'frontend', 'start'],
+    }
+  }
+  return { command: 'npm', args: ['--prefix', 'frontend', 'start'] }
 }
 
 function start(name, command, args, options = {}) {
@@ -96,7 +103,8 @@ if (!BACKEND_PORT_IS_NUMBER) {
 }
 
 start('backend', process.env.PYTHON || 'python', backendArgs)
-start('frontend', 'npm', ['--prefix', 'frontend', 'start'], { shell: true })
+const frontend = frontendCommand()
+start('frontend', frontend.command, frontend.args)
 
 console.log(`\n  Frontend : http://localhost:${FRONTEND_PORT}`)
 console.log(`  Backend  : http://127.0.0.1:${BACKEND_PORT}`)

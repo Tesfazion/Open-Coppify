@@ -31,6 +31,8 @@ from config import (
     YTDLP_MERGE_FORMAT,
     YTDLP_RETRIES,
     YTDLP_SOCKET_TIMEOUT,
+    YTDLP_COOKIES_FROM_BROWSER,
+    YTDLP_JS_RUNTIME,
 )
 from jobs import JobContext
 from services import ffmpeg_utils
@@ -238,8 +240,7 @@ def download_video(
 
     ctx.progress(6, "Fetching video metadata")
     try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(canonical_url(video_id), download=True)
+        info = _download_with_retries(ctx, video_id, outtmpl, format_selector, ffmpeg_location)
     except yt_dlp.utils.DownloadError as exc:
         message = str(exc)
         lowered = message.lower()
@@ -250,7 +251,7 @@ def download_video(
         if "sign in" in lowered or "confirm you" in lowered or "bot" in lowered:
             raise RuntimeError(
                 "YouTube is asking for a sign-in/bot check. Try a different video, "
-                "or pass cookies via yt-dlp's cookie options."
+                "or set COPPIFY_YTDLP_COOKIES=firefox to use your browser cookies."
             ) from exc
         raise RuntimeError(f"yt-dlp failed: {message}") from exc
 
@@ -271,6 +272,82 @@ def download_video(
     ctx.progress(97, "Download complete")
     ctx.log(f"Saved {downloaded.name} ({downloaded.stat().st_size / 1e6:.1f} MB)")
     return metadata
+
+
+def _download_with_retries(
+    ctx: JobContext,
+    video_id: str,
+    outtmpl: str,
+    format_selector: str,
+    ffmpeg_location: str | None,
+) -> dict[str, Any]:
+    """Retry yt-dlp extraction with back-off for transient 429s."""
+    import yt_dlp
+
+    base_options = _yt_dlp_options(
+        ctx=ctx,
+        video_id=video_id,
+        outtmpl=outtmpl,
+        format_selector=format_selector,
+        ffmpeg_location=ffmpeg_location,
+    )
+    attempts = max(1, YTDLP_RETRIES)
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        ctx.check_cancelled()
+        ctx.log(f"yt-dlp attempt {attempt}/{attempts}")
+        try:
+            with yt_dlp.YoutubeDL(base_options) as ydl:
+                return ydl.extract_info(canonical_url(video_id), download=True)
+        except yt_dlp.utils.DownloadError as exc:
+            message = str(exc)
+            last_exc = exc
+            lowered = message.lower()
+            if "429" in lowered or "too many requests" in lowered:
+                if attempt < attempts:
+                    wait = min(60.0, 5.0 * (2 ** (attempt - 1)))
+                    ctx.log(f"Rate limited. Retrying in {wait:.0f}s…", "warn")
+                    time.sleep(wait)
+                    continue
+            raise
+    raise last_exc  # type: ignore[misc]
+
+
+def _yt_dlp_options(
+    ctx: JobContext,
+    *,
+    video_id: str,
+    outtmpl: str,
+    format_selector: str,
+    ffmpeg_location: str | None,
+) -> dict[str, Any]:
+    target_dir = video_dir(video_id)
+    options: dict[str, Any] = {
+        "format": format_selector,
+        "outtmpl": outtmpl,
+        "merge_output_format": YTDLP_MERGE_FORMAT,
+        "noplaylist": True,
+        "retries": YTDLP_RETRIES,
+        "fragment_retries": YTDLP_RETRIES,
+        "socket_timeout": YTDLP_SOCKET_TIMEOUT,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "windowsfilenames": True,
+        "overwrites": False,
+        "continuedl": True,
+        "cachedir": str(TMP_DIR),
+        "progress_hooks": [_make_progress_hook(ctx)],
+        "postprocessor_hooks": [_make_postprocessor_hook(ctx)],
+        "logger": _QuietLogger(ctx),
+    }
+    if ffmpeg_location:
+        options["ffmpeg_location"] = ffmpeg_location
+    if YTDLP_COOKIES_FROM_BROWSER:
+        options["cookiesfrombrowser"] = [(YTDLP_COOKIES_FROM_BROWSER,)]
+    if YTDLP_JS_RUNTIME:
+        options["js_runtimes"] = [YTDLP_JS_RUNTIME]
+    return options
 
 
 def _make_progress_hook(ctx: JobContext):

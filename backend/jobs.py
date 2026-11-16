@@ -2,15 +2,25 @@
 
 Every long-running operation (download, transcribe, clip render) runs on a
 background thread and publishes a monotonic ``progress`` percentage plus a
-human-readable ``stage`` string. The React frontend polls ``GET /api/jobs/<id>``
-and renders that as a progress bar.
+human-readable ``stage`` string.
 
-A single global lock guards the registry; individual jobs also carry their own
-condition variable so waiters can block until they finish.
+Two ways to watch a job:
+
+* ``GET /api/jobs/<id>`` -- a snapshot. Simple, stateless, and what a script or
+  the initial page load wants.
+* ``GET /api/jobs/<id>/events`` -- a Server-Sent Events stream. Progress during
+  a long render changes several times a second, and polling that at a visible
+  cadence looks frozen between updates. SSE pushes each change as it happens.
+
+Listeners are registered on :class:`Job` rather than on the store so a subscriber
+only ever sees the job it asked for. Every emit is best-effort: a listener that
+raises or has gone away is dropped rather than allowed to break the worker
+thread that happened to trigger the update.
 """
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 import traceback
@@ -31,6 +41,11 @@ TERMINAL_STATES = {SUCCEEDED, FAILED, CANCELLED}
 
 # Keep the tail of the log so the UI can show what happened without unbounded growth.
 MAX_LOG_LINES = 200
+
+# Progress updates are emitted far more often than a human can read. Coalescing
+# them keeps a 3-hour render from producing millions of queued frames when the
+# client is on a slow link or, worse, is not reading at all.
+LISTENER_QUEUE_LIMIT = 64
 
 
 class JobCancelled(RuntimeError):
@@ -54,6 +69,64 @@ class Job:
     _cancel: threading.Event = field(default_factory=threading.Event, repr=False)
     _done: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _listeners: list["queue.Queue[dict[str, Any]]"] = field(
+        default_factory=list, repr=False
+    )
+    _listener_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False
+    )
+    # Retained so a failed job can be resubmitted without the caller having to
+    # reconstruct the closure that produced it.
+    _worker: Callable[["JobContext"], dict[str, Any]] | None = field(
+        default=None, repr=False
+    )
+
+    # -- listeners ----------------------------------------------------------
+    def subscribe(self) -> "queue.Queue[dict[str, Any]]":
+        """Register a listener and immediately replay current state to it.
+
+        The snapshot matters: a client that connects mid-job must not wait for
+        the next progress tick to learn where the job already is.
+        """
+        sink: "queue.Queue[dict[str, Any]]" = queue.Queue(maxsize=LISTENER_QUEUE_LIMIT)
+        with self._listener_lock:
+            self._listeners.append(sink)
+        sink.put({"event": "snapshot", "job": self.to_dict(include_logs=False)})
+        return sink
+
+    def unsubscribe(self, sink: "queue.Queue[dict[str, Any]]") -> None:
+        with self._listener_lock:
+            if sink in self._listeners:
+                self._listeners.remove(sink)
+
+    def _emit(self, event: str, **payload: Any) -> None:
+        """Fan out an event, dropping any listener that cannot keep up.
+
+        Never raises: this runs on the worker thread, and a slow or broken SSE
+        client must not be able to fail a render.
+        """
+        with self._listener_lock:
+            targets = list(self._listeners)
+        if not targets:
+            return
+        message = {"event": event, **payload}
+        for sink in targets:
+            try:
+                sink.put_nowait(message)
+            except queue.Full:
+                # Replace the oldest frame rather than block the worker.
+                try:
+                    sink.get_nowait()
+                    sink.put_nowait(message)
+                except Exception:  # noqa: BLE001
+                    with self._listener_lock:
+                        if sink in self._listeners:
+                            self._listeners.remove(sink)
+
+    def _emit_terminal(self, event: str, **payload: Any) -> None:
+        self._emit(event, **payload)
+        with self._listener_lock:
+            self._listeners.clear()
 
     # -- mutation helpers ---------------------------------------------------
     def _touch(self) -> None:
@@ -67,13 +140,16 @@ class Job:
             if len(self.logs) > MAX_LOG_LINES:
                 del self.logs[: len(self.logs) - MAX_LOG_LINES]
         self._touch()
+        self._emit("log", level=level, message=str(message))
 
     def set_progress(self, percent: float, stage: str | None = None) -> None:
         with self._lock:
             self.progress = max(0.0, min(100.0, float(percent)))
             if stage:
                 self.stage = str(stage)
+            snapshot = (self.progress, self.stage)
         self._touch()
+        self._emit("progress", progress=round(snapshot[0], 2), stage=snapshot[1])
 
     def to_dict(self, include_logs: bool = True) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -192,6 +268,7 @@ class JobStore:
     ) -> Job:
         """Create a job and run ``worker(ctx)`` on a daemon thread."""
         job = self.create(job_type, params)
+        job._worker = worker
         ctx = JobContext(job)
 
         def _run() -> None:
@@ -223,9 +300,42 @@ class JobStore:
                 job._touch()
                 job._done.set()
                 self._finalize(job)
+                # Terminal events go last so a listener that wakes up here can
+                # still read the final status off the snapshot it is handed.
+                event = {
+                    SUCCEEDED: "succeeded",
+                    FAILED: "failed",
+                    CANCELLED: "cancelled",
+                }.get(job.status, "succeeded")
+                job._emit_terminal(
+                    event, error=job.error, result=job.result
+                )
 
         threading.Thread(target=_run, name=f"coppify-{job_type}-{job.id}", daemon=True).start()
         return job
+
+    def retry(self, job_id: str) -> Job | None:
+        """Resubmit a finished job's worker as a fresh job.
+
+        A new id is issued rather than resetting the old one: the previous
+        attempt's id stays meaningful in logs and in any browser tab still
+        watching it, and a client holding the old id gets a clean 404 instead of
+        silently following a second run.
+        """
+        with self._lock:
+            original = self._jobs.get(job_id)
+            if original is None:
+                return None
+            worker = original._worker
+            job_type = original.type
+            params = dict(original.params)
+
+        if worker is None or original.status not in TERMINAL_STATES:
+            return None
+        # A retry must not inherit a stale cancellation flag from the attempt
+        # that was cancelled.
+        params.pop("job_id", None)
+        return self.submit(job_type, worker, params=params)
 
 
 # Process-wide singleton shared by the routes.

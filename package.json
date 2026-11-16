@@ -2,14 +2,25 @@
   "name": "coppify",
   "version": "1.0.0",
   "private": true,
+  "workspaces": [
+    "apps/web"
+  ],
   "description": "Turn a YouTube link into 9:16 short clips (yt-dlp + Whisper + FFmpeg)",
   "scripts": {
-    "install:all": "python -m pip install -r backend/requirements.txt && npm --prefix frontend install",
+    "install:all": "npm install && python -m pip install -r backend/requirements.txt && npm --prefix frontend install",
     "backend": "python backend/app.py",
     "frontend": "npm --prefix frontend start",
     "start": "node scripts/dev.mjs",
+    "web": "npm run dev --workspace @coppify/web",
+    "web:build": "npm run build --workspace @coppify/web",
+    "web:lint": "npm run lint --workspace @coppify/web",
+    "web:test": "npm test --workspace @coppify/web",
+    "web:typecheck": "npm run typecheck --workspace @coppify/web",
+    "db:generate": "npm run db:generate --workspace @coppify/web",
+    "db:migrate": "npm run db:migrate --workspace @coppify/web",
     "build": "npm --prefix frontend run build",
-    "test": "python backend/selftest.py && python backend/smoke_test.py && python backend/integration_check.py"
+    "typecheck": "npm --prefix frontend run typecheck",
+    "test": "python backend/selftest.py && python backend/smoke_test.py && python backend/contract_check.py && python backend/integration_check.py && npm test --workspace @coppify/web"
   },
   "engines": {
     "node": ">=20.19"

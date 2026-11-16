@@ -1,0 +1,309 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum WorkspaceRole {
+  OWNER
+  ADMIN
+  EDITOR
+  VIEWER
+}
+
+enum AssetStatus {
+  UPLOADING
+  READY
+  FAILED
+}
+
+enum ProcessingJobStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELED
+}
+
+enum ClipStatus {
+  CANDIDATE
+  APPROVED
+  REJECTED
+}
+
+enum ExportFormat {
+  MP4
+  SRT
+  VTT
+  JSON
+}
+
+model User {
+  id            String            @id @default(cuid())
+  name          String?
+  email         String?           @unique
+  emailVerified DateTime?
+  image         String?
+  accounts      Account[]
+  sessions      Session[]
+  memberships   WorkspaceMember[]
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+model Workspace {
+  id          String               @id @default(cuid())
+  name        String               @db.VarChar(80)
+  slug        String               @unique @db.VarChar(64)
+  memberships WorkspaceMember[]
+  projects    Project[]
+  assets      SourceAsset[]
+  jobs        ProcessingJob[]
+  jobEvents   ProcessingJobEvent[]
+  transcripts Transcript[]
+  clips       Clip[]
+  exports     ClipExport[]
+  usageEvents UsageEvent[]
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+}
+
+model WorkspaceMember {
+  workspaceId String
+  userId      String
+  role        WorkspaceRole
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt   DateTime      @default(now())
+
+  @@id([workspaceId, userId])
+  @@index([userId])
+}
+
+model Project {
+  id          String          @id @default(cuid())
+  workspaceId String
+  name        String          @db.VarChar(120)
+  workspace   Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  assets      SourceAsset[]
+  jobs        ProcessingJob[]
+  clips       Clip[]
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@unique([id, workspaceId])
+  @@index([workspaceId, updatedAt])
+}
+
+model SourceAsset {
+  id               String          @id @default(cuid())
+  workspaceId      String
+  projectId        String
+  originalFilename String          @db.VarChar(255)
+  storageKey       String          @db.VarChar(512)
+  mimeType         String          @db.VarChar(128)
+  sizeBytes        BigInt
+  durationMs       Int?
+  status           AssetStatus     @default(UPLOADING)
+  workspace        Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project          Project         @relation(fields: [projectId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  jobs             ProcessingJob[]
+  transcripts      Transcript[]
+  clips            Clip[]
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  @@unique([id, workspaceId])
+  @@unique([workspaceId, storageKey])
+  @@index([workspaceId, projectId, createdAt])
+}
+
+model ProcessingJob {
+  id                String               @id @default(cuid())
+  workspaceId       String
+  projectId         String
+  sourceAssetId     String
+  status            ProcessingJobStatus  @default(QUEUED)
+  stage             String?              @db.VarChar(64)
+  progress          Int                  @default(0)
+  bullJobId         String?              @unique @db.VarChar(128)
+  idempotencyKey    String?              @db.VarChar(128)
+  errorCode         String?              @db.VarChar(64)
+  errorMessage      String?              @db.VarChar(512)
+  cancelRequestedAt DateTime?
+  workspace         Workspace            @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project           Project              @relation(fields: [projectId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  sourceAsset       SourceAsset          @relation(fields: [sourceAssetId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  events            ProcessingJobEvent[]
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+
+  @@unique([id, workspaceId])
+  @@unique([workspaceId, idempotencyKey])
+  @@index([workspaceId, status, createdAt])
+  @@index([sourceAssetId, createdAt])
+}
+
+model ProcessingJobEvent {
+  id          String               @id @default(cuid())
+  jobId       String
+  workspaceId String
+  eventType   String               @db.VarChar(32)
+  status      ProcessingJobStatus?
+  stage       String?              @db.VarChar(64)
+  progress    Int?
+  message     String?              @db.VarChar(512)
+  metadata    Json?
+  createdAt   DateTime             @default(now())
+  job         ProcessingJob        @relation(fields: [jobId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  workspace   Workspace            @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, jobId, createdAt])
+}
+
+model Transcript {
+  id            String              @id @default(cuid())
+  workspaceId   String
+  sourceAssetId String
+  version       Int                 @default(1)
+  language      String?             @db.VarChar(16)
+  provider      String              @db.VarChar(64)
+  sourceAsset   SourceAsset         @relation(fields: [sourceAssetId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  workspace     Workspace           @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  segments      TranscriptSegment[]
+  createdAt     DateTime            @default(now())
+  clips         Clip[]
+
+  @@unique([id, workspaceId])
+  @@unique([sourceAssetId, workspaceId, version])
+  @@index([workspaceId, createdAt])
+}
+
+model TranscriptSegment {
+  id           String           @id @default(cuid())
+  transcriptId String
+  ordinal      Int
+  text         String           @db.Text
+  startMs      Int
+  endMs        Int
+  confidence   Float?
+  speakerLabel String?          @db.VarChar(64)
+  paragraph    Int?
+  transcript   Transcript       @relation(fields: [transcriptId], references: [id], onDelete: Cascade)
+  words        TranscriptWord[]
+
+  @@unique([transcriptId, ordinal])
+  @@index([transcriptId, startMs])
+}
+
+model TranscriptWord {
+  id         String            @id @default(cuid())
+  segmentId  String
+  ordinal    Int
+  text       String            @db.VarChar(256)
+  startMs    Int
+  endMs      Int
+  confidence Float?
+  segment    TranscriptSegment @relation(fields: [segmentId], references: [id], onDelete: Cascade)
+
+  @@unique([segmentId, ordinal])
+  @@index([segmentId, startMs])
+}
+
+model Clip {
+  id                String       @id @default(cuid())
+  workspaceId       String
+  projectId         String
+  sourceAssetId     String
+  transcriptId      String?
+  title             String?      @db.VarChar(160)
+  startMs           Int
+  endMs             Int
+  status            ClipStatus   @default(CANDIDATE)
+  viralScore        Float?
+  retentionScore    Float?
+  engagementScore   Float?
+  shareabilityScore Float?
+  scoreDetails      Json?
+  hookVariants      Json?
+  workspace         Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project           Project      @relation(fields: [projectId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  sourceAsset       SourceAsset  @relation(fields: [sourceAssetId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  transcript        Transcript?  @relation(fields: [transcriptId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  exports           ClipExport[]
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  @@unique([id, workspaceId])
+  @@index([workspaceId, projectId, status, createdAt])
+  @@index([workspaceId, viralScore])
+}
+
+model ClipExport {
+  id          String       @id @default(cuid())
+  workspaceId String
+  clipId      String
+  format      ExportFormat
+  aspectRatio String?      @db.VarChar(8)
+  storageKey  String       @db.VarChar(512)
+  workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  clip        Clip         @relation(fields: [clipId, workspaceId], references: [id, workspaceId], onDelete: Cascade)
+  createdAt   DateTime     @default(now())
+
+  @@index([workspaceId, clipId, createdAt])
+}
+
+model UsageEvent {
+  id             String    @id @default(cuid())
+  workspaceId    String
+  kind           String    @db.VarChar(64)
+  quantity       BigInt    @default(1)
+  idempotencyKey String?   @db.VarChar(128)
+  metadata       Json?
+  occurredAt     DateTime  @default(now())
+  workspace      Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, idempotencyKey])
+  @@index([workspaceId, occurredAt])
+  @@index([workspaceId, kind, occurredAt])
+}

@@ -2,49 +2,84 @@
 
 Endpoint surface
 ----------------
+Ingest / pipeline
 ``POST   /api/download``          start a yt-dlp download          -> job
 ``GET    /api/download/<job_id>`` download job status
 ``POST   /api/transcribe``        start Whisper transcription     -> job
 ``GET    /api/transcribe/<job_id>``transcription job status
-``POST   /api/clips``             select + render vertical clips  -> job
-``GET    /api/clips``             gallery listing of every clip
-``GET    /api/clips/<job_id>``    clip job status
+``POST   /api/clips``             select + render clips           -> job
+``GET    /api/clips/job/<job_id>``clip job status
+``GET    /api/transcript/<video_id>``   cached transcript
+
+Jobs
+``GET    /api/jobs``              recent jobs
+``GET    /api/jobs/<job_id>``     snapshot status for any job type
+``GET    /api/jobs/<job_id>/events``  Server-Sent Events progress stream
+``POST   /api/jobs/<job_id>/cancel``  request cancellation
+``POST   /api/jobs/<job_id>/retry``   resubmit a finished job
+
+Review
+``GET    /api/clips``             clip listing (optionally per video)
+``GET    /api/clips/<clip_id>``   one clip
+``PATCH  /api/clips/<clip_id>``   trim, keep/drop, retitle
+``GET    /api/clips/<clip_id>/words``  word timings inside the clip
+``GET    /api/clips/<clip_id>/srt``    caption sidecar
+``POST   /api/clips/<clip_id>/render`` re-encode at a ratio/style -> job
+``POST   /api/clips/render``      re-encode several clips at once -> job
 ``GET    /api/clips/<clip_id>/download``  force-download a clip
 ``DELETE /api/clips/<clip_id>``   delete a clip
-``GET    /api/jobs/<job_id>``     generic status for any job type
-``POST   /api/jobs/<job_id>/cancel``    request cancellation
+``POST   /api/clips/clear``       delete every clip
+
+Library
+``GET    /api/projects``          every video held on disk, newest first
+``GET    /api/projects/<video_id>``   one video with its counts
+``GET    /api/library``           disk and content totals
 ``GET    /api/video/<video_id>``  cached video metadata
-``GET    /api/transcript/<video_id>``   cached transcript
+``DELETE /api/video/<video_id>``  delete a video and its clips
+
+Settings / diagnostics
+``GET    /api/settings``          persisted settings + available choices
+``PUT    /api/settings``          update settings
+``POST   /api/settings/reset``    restore defaults
 ``GET    /api/health``            ffmpeg / whisper / yt-dlp status
 
-Every mutating endpoint is asynchronous: it returns a job id immediately and
-the frontend polls ``/api/jobs/<job_id>``. The long-running stages (Whisper
-model loading, FFmpeg encoding) would otherwise exceed browser and proxy
-timeouts.
+Every mutating endpoint that does real work is asynchronous: it returns a job id
+immediately and the client follows it. The long-running stages (Whisper model
+loading, FFmpeg encoding) would otherwise exceed browser and proxy timeouts.
 """
 
 from __future__ import annotations
 
+import json
+import queue
 import re
+from pathlib import Path
 from typing import Any
 
-from flask import Blueprint, jsonify, request, send_from_directory
+from flask import Blueprint, Response, jsonify, request, send_from_directory
 
 from config import (
+    ASPECT_RATIOS,
+    CAPTION_STYLES,
     CLIP_MAX_SECONDS,
     CLIP_MIN_SECONDS,
     CLIP_TARGET_SECONDS,
     CLIPS_DIR,
+    DEFAULT_ASPECT_RATIO,
     TRANSCRIPTS_DIR,
     VERTICAL_HEIGHT,
     VERTICAL_WIDTH,
 )
 from jobs import job_store
-from services import clipper, downloader, ffmpeg_utils, transcriber
+from services import clipper, downloader, ffmpeg_utils, projects, settings, transcriber
 
 api = Blueprint("api", __name__, url_prefix="/api")
 
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# How long an SSE stream waits before emitting a comment frame to keep an
+# otherwise-idle connection alive through a slow FFmpeg stage.
+_SSE_KEEPALIVE_SECONDS = 15.0
 
 
 def _error(message: str, status: int = 400, **extra: Any):
@@ -321,9 +356,221 @@ def list_clips():
     })
 
 
-@api.get("/clips/<job_id>")
+@api.get("/clips/job/<job_id>")
 def clips_job_status(job_id: str):
     return _job_response(job_id, "clips")
+
+
+@api.get("/clips/<clip_id>")
+def get_clip(clip_id: str):
+    clip = clipper.get_clip(clip_id)
+    if clip is None:
+        return _error("Unknown clip.", 404)
+    return jsonify({"ok": True, "clip": clip})
+
+
+@api.patch("/clips/<clip_id>")
+def patch_clip(clip_id: str):
+    """Trim, keep/drop, or retitle a clip.
+
+    Deliberately does not re-encode: dragging a trim handle should feel
+    instant, and the encode is a separate, slower step the client asks for
+    explicitly once the cut is settled.
+    """
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+
+    start = payload.get("start", payload.get("start_s"))
+    end = payload.get("end", payload.get("end_s"))
+    if start is not None:
+        start = _float_arg(start, None, low=0.0, high=86400.0)
+    if end is not None:
+        end = _float_arg(end, None, low=0.0, high=86400.0)
+
+    try:
+        clip = clipper.update_clip(
+            clip_id,
+            status=payload.get("status"),
+            start=start,
+            end=end,
+            title=payload.get("title"),
+        )
+    except ValueError as exc:
+        return _error(str(exc))
+
+    if clip is None:
+        return _error("Unknown clip.", 404)
+    projects.invalidate()
+    return jsonify({"ok": True, "clip": clip})
+
+
+@api.get("/clips/<clip_id>/words")
+def clip_words(clip_id: str):
+    """Word timings inside the clip, relative to its start.
+
+    Drives the trim bar and the caption editor. A clip with no transcript simply
+    has no words, which is a valid answer rather than an error.
+    """
+    if clipper.get_clip(clip_id) is None:
+        return _error("Unknown clip.", 404)
+    return jsonify({"ok": True, "words": clipper.clip_words(clip_id)})
+
+
+@api.get("/clips/<clip_id>/srt")
+def clip_srt(clip_id: str):
+    if clipper.get_clip(clip_id) is None:
+        return _error("Unknown clip.", 404)
+    path = CLIPS_DIR / f"{clip_id}.srt"
+    if not path.exists():
+        return _error("No caption file has been written for this clip.", 404)
+    return Response(
+        path.read_text(encoding="utf-8"),
+        mimetype="application/x-subrip",
+        headers={"Content-Disposition": f'attachment; filename="{clip_id}.srt"'},
+    )
+
+
+@api.post("/clips/<clip_id>/subtitle")
+def upload_clip_subtitle(clip_id: str):
+    """Upload a custom subtitle file for a clip.
+
+    Accepts an SRT file under the field name ``subtitle``. The file is written
+    next to the clip as ``{clip_id}.srt`` and the manifest is updated so the
+    review screen can offer it for download.
+    """
+    if clipper.get_clip(clip_id) is None:
+        return _error("Unknown clip.", 404)
+
+    uploaded = request.files.get("subtitle")
+    if not uploaded or uploaded.filename == "":
+        return _error("Upload a subtitle file under the field name 'subtitle'.")
+
+    filename = uploaded.filename.lower()
+    if not filename.endswith(".srt"):
+        return _error("Only .srt subtitle files are supported.")
+
+    destination = CLIPS_DIR / f"{clip_id}.srt"
+    uploaded.save(str(destination))
+
+    # Update manifest so the review screen knows captions are present.
+    clips = clipper.load_manifest().get("clips", [])
+    updated = False
+    for clip in clips:
+        if clip.get("id") == clip_id:
+            clip["captions"] = True
+            clip["has_captions"] = True
+            updated = True
+            break
+    if updated:
+        clipper.save_manifest({"clips": clips})
+
+    return jsonify({"ok": True, "clip_id": clip_id, "subtitle": destination.name})
+
+
+def _render_worker(clip_ids: list[str], options: dict[str, Any]):
+    """Shared worker for single and batch re-renders."""
+
+    def worker(ctx):
+        rendered: list[dict[str, Any]] = []
+        failures: list[dict[str, str]] = []
+        total = max(1, len(clip_ids))
+        for index, clip_id in enumerate(clip_ids):
+            ctx.check_cancelled()
+            ctx.progress(
+                100 * index / total,
+                f"Rendering {index + 1}/{total}",
+            )
+            try:
+                clip = clipper.rerender_clip(ctx, clip_id, **options)
+                rendered.append(clip)
+            except (FileNotFoundError, ValueError) as exc:
+                # One bad clip must not abandon the rest of the batch; the
+                # failures come back alongside whatever did render.
+                failures.append({"clip_id": clip_id, "error": str(exc)})
+                ctx.log(f"{clip_id}: {exc}", "error")
+        ctx.progress(100, f"Rendered {len(rendered)}/{total} clips")
+        return {"rendered": rendered, "failed": failures, "count": len(rendered)}
+
+    return worker
+
+
+@api.post("/clips/<clip_id>/render")
+def render_clip(clip_id: str):
+    if clipper.get_clip(clip_id) is None:
+        return _error("Unknown clip.", 404)
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+
+    options: dict[str, Any] = {}
+    ratio = str(payload.get("aspect_ratio") or payload.get("ratio") or "").strip()
+    if ratio:
+        if ratio not in ASPECT_RATIOS:
+            return _error(f"aspect_ratio must be one of: {', '.join(ASPECT_RATIOS)}")
+        options["aspect_ratio"] = ratio
+    style = str(payload.get("caption_style") or "").strip()
+    if style:
+        if style not in CAPTION_STYLES:
+            return _error(f"caption_style must be one of: {', '.join(CAPTION_STYLES)}")
+        options["caption_style_key"] = style
+    if "captions" in payload:
+        options["captions"] = _bool_arg(payload.get("captions"), True)
+
+    job = job_store.submit(
+        "render",
+        _render_worker([clip_id], options),
+        params={"clip_ids": [clip_id], **options},
+    )
+    return jsonify({"ok": True, "job": job.to_dict(include_logs=False)}), 202
+
+
+@api.post("/clips/render")
+def render_clips_batch():
+    """Re-encode several clips in one job. Defaults to every kept clip."""
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+
+    if payload.get("clip_ids"):
+        raw = payload["clip_ids"]
+        if isinstance(raw, str):
+            clip_ids = [part.strip() for part in raw.split(",") if part.strip()]
+        elif isinstance(raw, (list, tuple)):
+            clip_ids = [str(item).strip() for item in raw if str(item).strip()]
+        else:
+            clip_ids = []
+    else:
+        status = str(payload.get("status") or "kept").strip().lower()
+        wanted = {status} if status in clipper.CLIP_STATUSES else set(clipper.CLIP_STATUSES)
+        clip_ids = [
+            str(clip["id"])
+            for clip in clipper.list_clips()
+            if str(clip.get("status") or "candidate") in wanted
+        ]
+
+    clip_ids = clip_ids[:50]
+    if not clip_ids:
+        return _error("No clips matched that request.", 404)
+
+    options: dict[str, Any] = {}
+    ratio = str(payload.get("aspect_ratio") or payload.get("ratio") or "").strip()
+    if ratio:
+        if ratio not in ASPECT_RATIOS:
+            return _error(f"aspect_ratio must be one of: {', '.join(ASPECT_RATIOS)}")
+        options["aspect_ratio"] = ratio
+    style = str(payload.get("caption_style") or "").strip()
+    if style:
+        if style not in CAPTION_STYLES:
+            return _error(f"caption_style must be one of: {', '.join(CAPTION_STYLES)}")
+        options["caption_style_key"] = style
+    if "captions" in payload:
+        options["captions"] = _bool_arg(payload.get("captions"), True)
+
+    job = job_store.submit(
+        "render",
+        _render_worker(clip_ids, options),
+        params={"clip_ids": clip_ids, **options},
+    )
+    return jsonify({
+        "ok": True,
+        "job": job.to_dict(include_logs=False),
+        "clip_ids": clip_ids,
+    }), 202
 
 
 @api.get("/clips/<clip_id>/download")
@@ -409,6 +656,56 @@ def list_transcripts():
 
 
 # ---------------------------------------------------------------------------
+# Projects / library
+#
+# The index of what is actually on disk. Without it the only route back to a
+# previous video is pasting its id into the form again.
+# ---------------------------------------------------------------------------
+@api.get("/projects")
+def list_projects():
+    include_empty = not _bool_arg(request.args.get("empty"), False)
+    records = projects.list_projects(include_empty=include_empty)
+    return jsonify({"ok": True, "count": len(records), "projects": records})
+
+
+@api.get("/projects/<video_id>")
+def get_project(video_id: str):
+    if not _VIDEO_ID_RE.match(video_id):
+        return _error("Invalid video id.")
+    record = projects.get_project(video_id)
+    if record is None:
+        return _error("Nothing on disk for that video.", 404)
+    clips = clipper.list_clips(video_id=video_id)
+    return jsonify({"ok": True, "project": record, "clips": clips})
+
+
+@api.get("/library")
+def library():
+    return jsonify({"ok": True, "summary": projects.library_summary()})
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+@api.get("/settings")
+def get_settings():
+    return jsonify({"ok": True, **settings.public()})
+
+
+@api.put("/settings")
+def put_settings():
+    """Partial update. Unknown keys are ignored and bad values are clamped."""
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    return jsonify({"ok": True, "settings": settings.save(payload)})
+
+
+@api.post("/settings/reset")
+def reset_settings():
+    settings.reset()
+    return jsonify({"ok": True, "settings": settings.load()})
+
+
+# ---------------------------------------------------------------------------
 # Jobs
 # ---------------------------------------------------------------------------
 def _job_response(job_id: str, expected_type: str | None = None):
@@ -425,11 +722,90 @@ def get_job(job_id: str):
     return _job_response(job_id)
 
 
+@api.get("/jobs/<job_id>/events")
+def job_events(job_id: str):
+    """Stream a job's progress as Server-Sent Events.
+
+    Preferred over polling on the progress screen: a render reports progress
+    several times a second, and a poll at any human-visible cadence leaves the
+    bar visibly stuck between updates.
+
+    Each connection gets a snapshot on open, so a client that connects halfway
+    through a long job renders immediately instead of waiting for the next tick.
+    A comment frame every ``_SSE_KEEPALIVE_SECONDS`` keeps intermediaries from
+    closing an idle connection during a slow FFmpeg stage.
+
+    Note: the Flask dev server is threaded, so each open stream holds a thread.
+    That is fine for a single-operator local tool; behind a real WSGI server,
+    confirm the worker class is threaded or the streams will serialise.
+    """
+    job = job_store.get(job_id)
+    if job is None:
+        return _error("Unknown job id.", 404)
+
+    sink = job.subscribe()
+
+    def stream():
+        try:
+            yield ": stream open\n\n"
+            while True:
+                try:
+                    message = sink.get(timeout=_SSE_KEEPALIVE_SECONDS)
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+                    continue
+
+                payload = {k: v for k, v in message.items() if k != "event"}
+                yield (
+                    f"event: {message['event']}\n"
+                    f"data: {json.dumps(payload, default=str)}\n\n"
+                )
+
+                if message["event"] in {"succeeded", "failed", "cancelled"}:
+                    break
+        except GeneratorExit:
+            # Client navigated away or closed the tab. Unhook so the job stops
+            # fanning out to a queue nobody reads.
+            raise
+        finally:
+            job.unsubscribe(sink)
+
+    response = Response(stream(), mimetype="text/event-stream")
+    response.headers["Cache-Control"] = "no-cache, no-transform"
+    response.headers["Connection"] = "keep-alive"
+    # Tell any reverse proxy not to buffer, which would defeat the point.
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
+
+
 @api.post("/jobs/<job_id>/cancel")
 def cancel_job(job_id: str):
     if not job_store.cancel(job_id):
         return _error("Job not found or already finished.", 404)
     return jsonify({"ok": True, "cancelling": job_id})
+
+
+@api.post("/jobs/<job_id>/retry")
+def retry_job(job_id: str):
+    """Resubmit a finished job's worker as a new job.
+
+    Returns the new job so the client can navigate to its progress page. A job
+    that is still running, or whose worker is no longer in memory, cannot be
+    retried -- in both cases the honest answer is to submit the request again.
+    """
+    existing = job_store.get(job_id)
+    if existing is None:
+        return _error("Unknown job id.", 404)
+
+    job = job_store.retry(job_id)
+    if job is None:
+        return _error(
+            "This job cannot be retried automatically. It is either still "
+            "running or too old to still hold its work.",
+            409,
+        )
+    return jsonify({"ok": True, "job": job.to_dict(include_logs=False),
+                    "job_id": job.id, "previous_job_id": job_id}), 202
 
 
 @api.get("/jobs")
@@ -499,18 +875,27 @@ def unload_models():
 
 @api.get("/config")
 def public_config():
+    """Defaults for a cold client.
+
+    Superseded by ``GET /api/settings``, which returns the operator's saved
+    preferences. Kept because it is the cheaper call and the one a script wants.
+    """
+    saved = settings.load()
     return jsonify({
         "ok": True,
         "defaults": {
-            "clip_count": 5,
-            "clip_min_seconds": CLIP_MIN_SECONDS,
-            "clip_max_seconds": CLIP_MAX_SECONDS,
-            "clip_target_seconds": CLIP_TARGET_SECONDS,
-            "vertical_modes": ["crop", "blur", "fit"],
-            "vertical_mode": "blur",
+            "clip_count": saved["clip_count"],
+            "clip_min_seconds": saved["min_seconds"],
+            "clip_max_seconds": saved["max_seconds"],
+            "clip_target_seconds": saved["target_seconds"],
+            "vertical_modes": list(settings.VERTICAL_MODE_CHOICES),
+            "vertical_mode": saved["vertical_mode"],
             "output": {"width": VERTICAL_WIDTH, "height": VERTICAL_HEIGHT},
-            "whisper_model": transcriber.WHISPER_MODEL,
-            "captions": True,
+            "aspect_ratios": list(settings.ASPECT_CHOICES),
+            "aspect_ratio": saved["aspect_ratio"],
+            "caption_styles": clipper.caption_style_catalog(),
+            "whisper_model": saved["whisper_model"],
+            "captions": saved["captions"],
         },
     })
 

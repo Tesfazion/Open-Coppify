@@ -84,6 +84,14 @@ YTDLP_RETRIES = _env_int("COPPIFY_YTDLP_RETRIES", 3)
 YTDLP_SOCKET_TIMEOUT = _env_int("COPPIFY_YTDLP_TIMEOUT", 30)
 DOWNLOAD_TIMEOUT_SECONDS = _env_int("COPPIFY_DOWNLOAD_TIMEOUT", 60 * 60 * 3)
 
+# Pass cookies from the browser to bypass bot checks.
+# Example: COPPIFY_YTDLP_COOKIES="firefox"
+YTDLP_COOKIES_FROM_BROWSER = os.environ.get("COPPIFY_YTDLP_COOKIES", "")
+
+# Preferred JS runtime for yt-dlp's EJS extraction, if installed.
+# Example: COPPIFY_YTDLP_JS_RUNTIME="node"
+YTDLP_JS_RUNTIME = os.environ.get("COPPIFY_YTDLP_JS_RUNTIME", "")
+
 # ---------------------------------------------------------------------------
 # Whisper
 # ---------------------------------------------------------------------------
@@ -115,6 +123,74 @@ VERTICAL_HEIGHT = _env_int("COPPIFY_VERTICAL_HEIGHT", 1920)
 CLIP_CRF = _env_int("COPPIFY_CLIP_CRF", 23)
 CLIP_PRESET = os.environ.get("COPPIFY_CLIP_PRESET", "veryfast")
 CLIP_AUDIO_BITRATE = os.environ.get("COPPIFY_CLIP_AUDIO_BITRATE", "128k")
+
+# How a non-vertical source is fitted into the frame.
+VERTICAL_MODE_DEFAULT = os.environ.get("COPPIFY_VERTICAL_MODE", "blur")
+VERTICAL_MODES = ("blur", "crop", "fit")
+
+# Output aspect ratios the renderer supports, with their pixel dimensions.
+# 9:16 is the default because it is the only one every short-form platform
+# accepts without letterboxing; the others exist because a creator sometimes
+# needs a square or a landscape cut for a different surface.
+ASPECT_RATIOS: dict[str, tuple[int, int]] = {
+    "9:16": (VERTICAL_WIDTH, VERTICAL_HEIGHT),
+    "1:1": (min(VERTICAL_WIDTH, VERTICAL_HEIGHT), min(VERTICAL_WIDTH, VERTICAL_HEIGHT)),
+    "16:9": (max(VERTICAL_WIDTH, VERTICAL_HEIGHT), min(VERTICAL_WIDTH, VERTICAL_HEIGHT)),
+}
+DEFAULT_ASPECT_RATIO = "9:16"
+
+# Caption looks. Each entry is an ASS force_style string fragment consumed by
+# clipper.build_subtitle_filter. The set is intentionally small: these are the
+# three treatments that actually survive being watched on a phone, rather than a
+# long list of near-identical options that make the choice meaningless.
+CAPTION_STYLES: dict[str, dict[str, str]] = {
+    "bold": {
+        "label": "Bold",
+        "description": "White uppercase, heavy outline. Reads at arm's length.",
+        "font": "Arial,Bold",
+        "size": "20",
+        "primary": "&H00FFFFFF",
+        "outline_colour": "&H00000000",
+        "border_style": "3",
+        "outline": "2",
+        "shadow": "0",
+        "alignment": "2",
+        "margin_v": "140",
+        "bold": "1",
+    },
+    "clean": {
+        "label": "Clean",
+        "description": "Sentence case, no outline. Quiet and editorial.",
+        "font": "Arial",
+        "size": "16",
+        "primary": "&H00FFFFFF",
+        "outline_colour": "&H90000000",
+        "border_style": "1",
+        "outline": "1",
+        "shadow": "0",
+        "alignment": "2",
+        "margin_v": "120",
+        "bold": "0",
+    },
+    "boxed": {
+        "label": "Boxed",
+        "description": "Solid background block. Highest contrast of the three.",
+        "font": "Arial,Bold",
+        "size": "18",
+        "primary": "&H00FFFFFF",
+        "outline_colour": "&H00000000",
+        "border_style": "3",
+        "outline": "0",
+        "shadow": "0",
+        "alignment": "2",
+        "margin_v": "150",
+        "bold": "1",
+    },
+}
+DEFAULT_CAPTION_STYLE = "bold"
+
+# Also written as an .srt next to the clip, for anyone who wants to re-cut it.
+WRITE_SRT_SIDECAR = _env_bool("COPPIFY_WRITE_SRT", False)
 
 # Horizontal fallback resolution when the source is taller than 9:16.
 CLIP_MAX_WIDTH = _env_int("COPPIFY_CLIP_MAX_WIDTH", 1920)
